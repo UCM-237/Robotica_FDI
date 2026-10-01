@@ -10,12 +10,27 @@
 #define CHIP_NAME "/dev/gpiochip0"
 
 // Pines Motor
-#define PIN_IN1 14
-#define PIN_IN2 16
+#define PIN_IN1 5
+#define PIN_IN2 6
 
+// Pines Encoder
+#define PIN_ENC_A 26
+#define PIN_ENC_B 21
 
 // Ruta del sysfs para el PWM Hardware en GPIO 12 (PWM0)
 #define PWM_PATH "/sys/class/pwm/pwmchip0/pwm0"
+
+// Variable global de posición (protegida si fuera necesario, o atómica)
+volatile long encoder_position = 0;
+volatile bool running = true;
+
+// Tabla de estados en cuadratura
+static const int8_t QUADRATURE_TABLE[16] = {
+     0,  1, -1,  0,
+    -1,  0,  0,  1,
+     1,  0,  0, -1,
+     0, -1,  1,  0
+};
 
 // --------------------------------------------------------------------------
 // Funciones de control de PWM por sysfs
@@ -49,6 +64,65 @@ void set_motor_speed(int duty_percent) {
     sysfs_write(PWM_PATH "/duty_cycle", buffer);
 }
 
+// --------------------------------------------------------------------------
+// Hilo de lectura del Encoder en background
+// --------------------------------------------------------------------------
+void* encoder_thread_func(void* arg) {
+    struct gpiod_chip *chip = gpiod_chip_open(CHIP_NAME);
+    if (!chip) {
+        perror("Error al abrir gpiochip para encoder");
+        return NULL;
+    }
+
+    struct gpiod_line_settings *settings = gpiod_line_settings_new();
+    gpiod_line_settings_set_direction(settings, GPIOD_LINE_DIRECTION_INPUT);
+    gpiod_line_settings_set_bias(settings, GPIOD_LINE_BIAS_PULL_UP);
+    gpiod_line_settings_set_edge_detection(settings, GPIOD_LINE_EDGE_BOTH);
+
+    unsigned int offsets[2] = {PIN_ENC_A, PIN_ENC_B};
+    struct gpiod_line_config *line_cfg = gpiod_line_config_new();
+    gpiod_line_config_add_line_settings(line_cfg, offsets, 2, settings);
+
+    struct gpiod_request_config *req_cfg = gpiod_request_config_new();
+    gpiod_request_config_set_consumer(req_cfg, "encoder-thread");
+
+    struct gpiod_line_request *request = gpiod_chip_request_lines(chip, req_cfg, line_cfg);
+    struct gpiod_edge_event_buffer *event_buffer = gpiod_edge_event_buffer_new(16);
+
+    enum gpiod_line_value vals[2];
+    gpiod_line_request_get_values(request, vals);
+    uint8_t state = (vals[0] << 1) | vals[1];
+
+    while (running) {
+        // Timeout de 100ms para revisar periódicamente la variable 'running'
+        int ret = gpiod_line_request_wait_edge_events(request, 100000000);
+        if (ret > 0) {
+            int num_events = gpiod_line_request_read_edge_events(request, event_buffer, 16);
+            if (num_events > 0) {
+                gpiod_line_request_get_values(request, vals);
+                uint8_t pin_a_val = (vals[0] == GPIOD_LINE_VALUE_ACTIVE) ? 1 : 0;
+                uint8_t pin_b_val = (vals[1] == GPIOD_LINE_VALUE_ACTIVE) ? 1 : 0;
+
+                uint8_t new_pins = (pin_a_val << 1) | pin_b_val;
+                state = ((state & 0x03) << 2) | new_pins;
+
+                int delta = QUADRATURE_TABLE[state & 0x0F];
+                if (delta != 0) {
+                    encoder_position += delta;
+                }
+            }
+        }
+    }
+
+    // Limpieza
+    gpiod_edge_event_buffer_free(event_buffer);
+    gpiod_line_request_release(request);
+    gpiod_request_config_free(req_cfg);
+    gpiod_line_config_free(line_cfg);
+    gpiod_line_settings_free(settings);
+    gpiod_chip_close(chip);
+    return NULL;
+}
 
 // --------------------------------------------------------------------------
 // Control de Dirección del Motor (IN1 e IN2)
@@ -98,6 +172,10 @@ int main(void) {
 
     struct gpiod_line_request *motor_request = gpiod_chip_request_lines(chip, motor_req_cfg, motor_line_cfg);
 
+    // 3. Lanzar hilo secundario para leer el Encoder
+    pthread_t enc_thread;
+    pthread_create(&enc_thread, NULL, encoder_thread_func, NULL);
+
     // 4. Secuencia de prueba del motor
     printf("--- INICIANDO SECUENCIA DEL MOTOR ---\n");
 
@@ -105,7 +183,12 @@ int main(void) {
     printf("Moviendo ADELANTE al 60%%...\n");
     set_motor_direction(motor_request, MOTOR_FORWARD);
     set_motor_speed(60);
-    usleep(3000000);
+
+    for (int i = 0; i < 30; i++) {
+        printf("Posición Encoder: %ld\n", encoder_position);
+        usleep(100000); // 100ms
+    }
+
     // Parada
     printf("PARANDO...\n");
     set_motor_speed(0);
@@ -116,13 +199,21 @@ int main(void) {
     printf("Moviendo ATRÁS al 80%%...\n");
     set_motor_direction(motor_request, MOTOR_BACKWARD);
     set_motor_speed(80);
-    usleep(3000000);
+
+    for (int i = 0; i < 30; i++) {
+        printf("Posición Encoder: %ld\n", encoder_position);
+        usleep(100000);
+    }
+
     // Parada Final
     printf("FIN. Parando motor...\n");
     set_motor_speed(0);
     set_motor_direction(motor_request, MOTOR_STOP);
 
- 
+    // Apagar hilo y limpiar recursos
+    running = false;
+    pthread_join(enc_thread, NULL);
+
     gpiod_line_request_release(motor_request);
     gpiod_request_config_free(motor_req_cfg);
     gpiod_line_config_free(motor_line_cfg);
